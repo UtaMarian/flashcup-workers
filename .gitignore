@@ -1,0 +1,11 @@
+node_modules/
+*.log
+npm-debug.log*
+
+# dotenv
+.env
+.env.*
+!.env.example
+
+# Prisma client is generated at install time (postinstall)
+vendor/flashleague/flashleague-backend/node_modules/
