@@ -78,8 +78,8 @@ Environment variables:
 
 | Key | Value |
 |---|---|
-| `DATABASE_URL` | **the same database the Flash Cup API uses** — Neon's *pooled* connection string |
-| `DIRECT_URL` | Neon's *unpooled* string; anywhere else, set it equal to `DATABASE_URL` |
+| `DATABASE_URL` | **the same database the Flash Cup API uses** — Neon's *pooled* string (`-pooler` host), with `?sslmode=require&pgbouncer=true` |
+| `DIRECT_URL` | Neon's *unpooled* string. Not used at runtime here (no migrations), but the shared Prisma schema references it. Anywhere else: same value as `DATABASE_URL`. |
 | `NODE_ENV` | `production` (plain JSON logs; skips `pino-pretty`) |
 
 Render auto-runs `git submodule update --init --recursive`, so `vendor/flashleague`

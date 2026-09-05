@@ -24,9 +24,9 @@ services:
     healthCheckPath: /
     autoDeploy: true
     envVars:
-      - key: DATABASE_URL      # SAME database the Flash Cup API uses (pooled string on Neon)
+      - key: DATABASE_URL      # SAME db as the API. Neon: POOLED string (-pooler host) + ?sslmode=require&pgbouncer=true
         sync: false
-      - key: DIRECT_URL        # unpooled string on Neon; else = DATABASE_URL
+      - key: DIRECT_URL        # Neon: UNPOOLED string. Unused at runtime here, but the shared schema references it. Else = DATABASE_URL.
         sync: false
       - key: NODE_ENV
         value: production
