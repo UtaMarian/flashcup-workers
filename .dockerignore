@@ -6,4 +6,4 @@ node_modules
 .env
 .env.*
 !.env.example
-# NOTE: vendor/ (the flashleague submodule) is required for the build — keep it.
+# NOTE: vendor/ (the vendored backend slice) is required for the build — keep it.

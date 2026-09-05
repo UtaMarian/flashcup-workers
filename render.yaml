@@ -10,8 +10,9 @@
 #    by pinging the service URL every ~10 min (e.g. a free cron-job.org job).
 #    On a paid instance ("starter" or above) there is no spin-down.
 #
-# Render auto-runs `git submodule update --init --recursive`, so vendor/flashleague
-# is fetched automatically (public HTTPS submodule).
+# The backend slice under vendor/ is committed in this repo (not a submodule),
+# so the build needs no extra fetch. buildCommand is pinned to `npm install`
+# because Render's Node default (`yarn`) ignores package-lock.json.
 
 services:
   - type: web

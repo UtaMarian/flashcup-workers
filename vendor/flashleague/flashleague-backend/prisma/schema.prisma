@@ -1,0 +1,1164 @@
+// Flash Cup — data model
+// Datasource: PostgreSQL, hosted on Neon. `DATABASE_URL` is the app/runtime
+// connection — point it at Neon's POOLED (PgBouncer, "-pooler" in the host)
+// connection string for normal query traffic. `DIRECT_URL` is what
+// `prisma migrate deploy`/`migrate dev` actually use for schema changes —
+// point it at Neon's UNPOOLED connection string (same host, minus
+// "-pooler"). Running migrations through the transaction-mode pooler is
+// unreliable (advisory locks / prepared statements don't survive pooled
+// sessions), so Neon and Prisma both recommend this split. See:
+// https://neon.tech/docs/guides/prisma
+// `SHADOW_DATABASE_URL` is only needed by `prisma migrate dev` when the DB
+// user cannot create databases (uncomment it below and set a second empty DB).
+// The previous SQLite datasource + its migrations are kept in
+// prisma/schema.sqlite.prisma and prisma/migrations_sqlite_backup/ for the
+// one-time data copy (scripts/migrateSqliteToPostgres.js). See MIGRATION.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  directUrl         = env("DIRECT_URL")
+  // shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+// Note: modeled as String fields, not Prisma `enum`s (kept from the original
+// SQLite design, which had no enum support). Allowed values are documented
+// alongside each field below. Safe to convert to real `enum`s on Postgres later.
+//
+// Role:               PLAYER | MANAGER | ADMIN
+// UserStatus:         ACTIVE | SUSPENDED | BANNED
+// Position:           GK | DC | LB | RB | DMC | MC | ML | MR | AMC | AML | AMR | ST | LW | RW
+// CompetitionType:     LIGA | CUPA_INTERNA | CUPA_CAMPIONILOR | CUPA_INTERNATIONALA |
+//                     SUPERCUPA_NATIONALA | SUPERCUPA_INTERNATIONALA
+// CompetitionStatus:  DRAFT | SCHEDULED | ACTIVE | FINISHED
+// MatchStatus:        SCHEDULED | PLAYED | POSTPONED
+// TeamHistoryReason:  JOINED | RESIGNED | KICKED | TRANSFERRED
+// MatchEventType:     GOAL | YELLOW_CARD | RED_CARD
+// PredictionChoice:   1 (home win) | X (draw) | 2 (away win)
+// PredictionOutcome:  PENDING | WON | LOST
+// TacticStyle:        ECHILIBRAT | OFENSIV | DEFENSIV | POSESIE | CONTRAATAC
+// TacticMarking:      ZONAL | OM_LA_OM
+// TacticPressing:     SCAZUT | MEDIU | RIDICAT
+// PostType:           TEXT | TROPHY
+// ArchiveLeagueType:  LIGA | CUPA_INTERNA | CUPA_CAMPIONILOR | CUPA_INTERNATIONALA |
+//                     SUPERCUPA_NATIONALA | SUPERCUPA_INTERNATIONALA
+// EventType:          DOUBLE_TRAINING_XP | DOUBLE_MATCH_XP | DOUBLE_MATCH_REWARDS |
+//                     DOUBLE_GOAL_ASSIST_REWARDS | DOUBLE_CHOREO_INFLUENCE |
+//                     FAST_ENERGY_REGEN | REWARD_WHEEL | POSITION_CHANGE | SUPERBET
+// EventStatus:        SCHEDULED | ACTIVE | ENDED | CANCELLED
+// EventClaimKind:     WHEEL_SPIN | SUPERBET_GRANT | SUPERBET_USED | POSITION_CHANGE
+
+// ---------------------------------------------------------------------------
+// MODELS
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  // Optional now — accounts created via Google/Facebook have no local password
+  // until the player sets one from the profile page.
+  passwordHash String?
+  firstName    String
+  lastName     String
+
+  // Social sign-in. Each provider's stable user id is stored once and unique.
+  // authProvider is the most recent method used: LOCAL | GOOGLE | FACEBOOK.
+  googleId     String? @unique
+  facebookId   String? @unique
+  avatarUrl    String?
+  authProvider String  @default("LOCAL")
+
+  // Email verification — required before a LOCAL (email/password) account can
+  // play. Social accounts are trusted (provider already verified the address)
+  // and get emailVerifiedAt set at creation. A 6-digit code is emailed; only
+  // its hash is stored (src/utils/emailVerification.js).
+  emailVerifiedAt      DateTime?
+  emailVerifyCodeHash  String?
+  emailVerifyExpiresAt DateTime?
+  emailVerifySentAt    DateTime?
+  emailVerifyAttempts  Int       @default(0)
+
+  // Password reset — same 6-digit-code mechanism, LOCAL accounts only
+  // (src/utils/passwordReset.js). Only the code hash is stored.
+  passwordResetCodeHash  String?
+  passwordResetExpiresAt DateTime?
+  passwordResetSentAt    DateTime?
+  passwordResetAttempts  Int       @default(0)
+
+  role   String @default("PLAYER")
+  status String @default("ACTIVE")
+
+  // On-field role, chosen at registration.
+  position String?
+  // ISO 3166-1 alpha-2 code (e.g. "RO", "GB") — rendered as a flag emoji.
+  nationality String?
+
+  teamId String?
+  team   Team?   @relation("CurrentSquad", fields: [teamId], references: [id])
+
+  // Progression — level is derived from xp using an exponential curve
+  // (see src/utils/xp.js). Stored redundantly for fast reads/sorting.
+  level  Int @default(1)
+  xp     Int @default(0)
+  energy Int @default(100)
+  // Regenerates +1 every 5 minutes (src/jobs/energyJob.js) — this marks the
+  // last tick applied, so the frontend can show a countdown to the next one.
+  lastEnergyRegenAt DateTime @default(now())
+  // Legacy: was an automatic daily grant. The daily gift is now a manual
+  // claim from the Shop (src/controllers/players.controller.js claimDailyGift).
+  lastDailyBonusAt  DateTime @default(now())
+  // Manual daily-gift claim (cash by level + 1 token, 24h cooldown). Null = never claimed yet.
+  lastDailyGiftAt      DateTime?
+  // One-time discounted Starter Pack purchase. Null = still available.
+  starterPackClaimedAt DateTime?
+  // One-time onboarding tutorial. Null until the player dismisses it.
+  tutorialSeenAt DateTime?
+  // Set when a manager-election poll makes this player the team manager; the
+  // app shows a one-time "you were elected manager" notice, then clears it.
+  managerElectedAt DateTime?
+  // JSON array of page ids whose one-time "coach tip" the player has dismissed.
+  pageTipsSeenJson String @default("[]")
+
+  // Attributes — trained individually (energy per session), grinding up to 1000.
+  attrSpeed     Int @default(30)
+  attrTechnique Int @default(30)
+  attrPassing   Int @default(30)
+  attrPhysical  Int @default(30)
+  attrDefense   Int @default(30)
+  attrAttack    Int @default(30)
+
+  // Career statistics, accumulated across every match/team.
+  totalGoals   Int @default(0)
+  totalAssists Int @default(0)
+  totalMatches Int @default(0)
+  // Times this player was the match MVP (most crowd influence contributed).
+  // Surfaced once on the player profile as a medal with this as its badge.
+  mvpCount     Int @default(0)
+
+  // Player economy — granted by default at account creation.
+  cash   Int @default(100)
+  tokens Int @default(10)
+
+  // Synthetic squad-filler account created by scripts/seedMockPlayers.js —
+  // never has real login use. Lets bot players be told apart from real ones.
+  isBot Boolean @default(false)
+
+  registeredAt DateTime  @default(now())
+  lastLoginAt  DateTime?
+  bannedAt     DateTime?
+  bannedReason String?
+
+  teamHistory       TeamHistory[]
+  posts             Post[]
+  comments          Comment[]
+  postReactions     PostReaction[]
+  goalEvents        MatchEvent[]       @relation("GoalScorer")
+  assistEvents      MatchEvent[]       @relation("AssistProvider")
+  choreographies    Choreography[]
+  trophies          TrophyPlayer[]
+  predictions       Prediction[]
+  predictionRewards PredictionReward[]
+  matchRewards      MatchReward[]
+  levelUpRewards    LevelUpReward[]
+  seasonInfluenceRewards SeasonInfluenceReward[]
+
+  offersReceived     TransferOffer[]   @relation("OfferTarget")
+  offersSentAsManager TransferOffer[]  @relation("OfferManager")
+  listingsAsPlayer   TransferListing[] @relation("ListingPlayer")
+  listingsAsManager  TransferListing[] @relation("ListingManager")
+  transfers          Transfer[]        @relation("TransferPlayer")
+
+  managerPollsAsCandidate ManagerPoll[]     @relation("PollCandidate")
+  managerPollsStarted     ManagerPoll[]     @relation("PollStarter")
+  managerPollVotes        ManagerPollVote[] @relation("PollVotes")
+
+  eventsCreated GameEvent[]      @relation("EventCreator")
+  eventClaims   GameEventClaim[] @relation("EventClaims")
+
+  contactMessages ContactMessage[] @relation("ContactAuthor")
+
+  friendRequestsSent     Friendship[]    @relation("FriendRequester")
+  friendRequestsReceived Friendship[]    @relation("FriendAddressee")
+  messagesSent           DirectMessage[] @relation("DMSender")
+  messagesReceived       DirectMessage[] @relation("DMRecipient")
+
+  // Referrals — `referralCode` is this user's own invite code (lazily
+  // generated on first visit to the invite page). `referralsMade` are the
+  // accounts they brought in; `referredBy` is the single referral row that
+  // credited someone else for bringing this account in.
+  referralCode  String?    @unique
+  referralsMade Referral[] @relation("ReferralReferrer")
+  referredBy    Referral?  @relation("ReferralReferred")
+
+  shopOrders ShopOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([teamId])
+  @@index([role])
+  @@index([status])
+}
+
+// Full history of every team a user has ever belonged to — resignations,
+// being kicked by a manager, or admin-driven transfers are all recorded here.
+model TeamHistory {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+  teamId String
+  team   Team   @relation(fields: [teamId], references: [id])
+
+  joinedAt DateTime           @default(now())
+  leftAt   DateTime?
+  reason   String @default("JOINED")
+
+  @@index([userId])
+  @@index([teamId])
+}
+
+model Team {
+  id       String  @id @default(cuid())
+  name     String
+  city     String?
+  colorHex String  @default("#1F6F4A")
+  // Optional secondary kit colour (manager/admin set). null → client picks a
+  // sensible default (white) for the striped jersey.
+  colorHex2 String?
+  logoUrl  String?
+
+  leagueId String?
+  league   League? @relation(fields: [leagueId], references: [id])
+
+  // Club treasury — separate from individual players' cash. Funded by
+  // season-end prize money (src/services/seasonService.js).
+  budget Int @default(100000)
+
+  createdAt DateTime @default(now())
+
+  players            User[]              @relation("CurrentSquad")
+  teamHistory        TeamHistory[]
+  posts              Post[]
+  homeMatches        Match[]             @relation("HomeTeam")
+  awayMatches        Match[]             @relation("AwayTeam")
+  choreographies     Choreography[]
+  trophies           Trophy[]
+  seasonRecords      TeamSeasonRecord[]
+  leaguesWon         League[]            @relation("LeagueWinner")
+  lineup             Lineup?
+
+  offersTo           TransferOffer[]     @relation("OfferToTeam")
+  offersFrom         TransferOffer[]     @relation("OfferFromTeam")
+  listingsFrom       TransferListing[]   @relation("ListingFromTeam")
+  listingsTo         TransferListing[]   @relation("ListingToTeam")
+  transfersIn        Transfer[]          @relation("TransferToTeam")
+  transfersOut       Transfer[]          @relation("TransferFromTeam")
+  managerPolls       ManagerPoll[]       @relation("TeamManagerPolls")
+
+  @@index([leagueId])
+}
+
+// A team's saved starting XI (Prim 11) + tactic settings. One per team —
+// saving a new lineup overwrites the previous one. `slotsJson` is a JSON
+// array of 11 `{ position, playerId }` entries, in the exact slot order of
+// src/utils/formations.js FORMATIONS[formation] (index 0 = GK). Read by
+// src/services/matchService.js to field the actual starters (instead of the
+// whole squad) and apply the tactic modifiers, once a team has a *complete*
+// lineup — see buildMatchSquad() for the fallback when it doesn't.
+model Lineup {
+  id     String @id @default(cuid())
+  teamId String @unique
+  team   Team   @relation(fields: [teamId], references: [id])
+
+  formation String // key into FORMATIONS, e.g. "4-4-2"
+  slotsJson String // JSON-encoded: [{ position: "GK", playerId: "..." | null }, ...] x11
+
+  style    String @default("ECHILIBRAT") // ECHILIBRAT | OFENSIV | DEFENSIV | POSESIE | CONTRAATAC
+  marking  String @default("ZONAL") // ZONAL | OM_LA_OM
+  pressing String @default("MEDIU") // SCAZUT | MEDIU | RIDICAT
+
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+// The single global season clock — every LIGA, and the one Cupa Campionilor
+// / Cupa Internațională generated per season, belong to exactly one Season.
+// Only one Season is ever ACTIVE at a time; closing it (src/services/
+// seasonService.js closeGlobalSeason()) requires every match in every LIGA
+// (and its Cupa Internă) that season to be PLAYED first.
+model Season {
+  id        String    @id @default(cuid())
+  number    Int       @unique
+  status    String    @default("ACTIVE") // ACTIVE | FINISHED
+  startedAt DateTime  @default(now())
+  closedAt  DateTime?
+
+  leagues League[]
+}
+
+// A League row represents one competition instance: a league (Liga), or one
+// of the cup types. Admin creates these, assigns teams, configures the
+// qualification slots and the daily match-time window, then "starts" it —
+// which triggers automatic fixture + kickoff-time generation.
+model League {
+  id     String             @id @default(cuid())
+  name   String
+  type   String @default("LIGA")
+  season String @default("2026/27")
+  status String @default("DRAFT")
+
+  // Flag shown beside the competition name. ISO 3166-1 alpha-2 country code
+  // (e.g. "ES") for national leagues/cups, or "INT" for the continental
+  // cups. Null = no flag. Admin-editable at any time; national cups inherit
+  // their parent LIGA's value on creation.
+  flag String?
+
+  startDate DateTime?
+  closedAt  DateTime?
+
+  // Every league belongs to exactly one global Season. seasonNumber is a
+  // denormalized copy of season.number, kept for cheap display/sorting.
+  seasonId     String?
+  seasonRef    Season? @relation(fields: [seasonId], references: [id])
+  seasonNumber Int?
+
+  // Set by src/services/seasonService.js closeSeason() once every match is
+  // PLAYED — the champion for a LIGA, or the knockout winner for a cup.
+  winnerTeamId String?
+  winnerTeam   Team?   @relation("LeagueWinner", fields: [winnerTeamId], references: [id])
+
+  // Kickoff-time window used when auto-generating match times.
+  matchDayStartHour Int @default(16) // 16:00
+  matchDayEndHour   Int @default(22) // 22:00
+
+  // Each round/etapa is played on its own calendar day.
+  daysBetweenRounds Int     @default(1)
+  doubleRoundRobin  Boolean @default(true) // home + away fixtures
+
+  // Qualification slots feeding the two cup competitions.
+  qualifyChampionsSlots      Int @default(2)
+  qualifyInternationalSlots  Int @default(2)
+
+  // Set only on an auto-generated CUPA_INTERNA league — points back at the
+  // LIGA whose POST /start triggered its creation. Cupa Campionilor / Cupa
+  // Internațională are season-wide (not tied to one LIGA) and leave this
+  // null; they're scoped by seasonId instead.
+  parentLeagueId String?
+  parentLeague   League?  @relation("CupOfLeague", fields: [parentLeagueId], references: [id])
+  cups           League[] @relation("CupOfLeague")
+
+  teams   Team[]
+  matches Match[]
+  predictionRewards PredictionReward[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Match {
+  id     String @id @default(cuid())
+  leagueId String
+  league   League @relation(fields: [leagueId], references: [id])
+
+  round Int // etapa number (or knockout round ordinal, for cup matches)
+
+  // Nullable — a knockout-bracket match may be created before its
+  // participants are known (they're filled in once the feeder match(es)
+  // are simulated). Round-robin (LIGA) matches always have both set.
+  homeTeamId String?
+  homeTeam   Team?  @relation("HomeTeam", fields: [homeTeamId], references: [id])
+  awayTeamId String?
+  awayTeam   Team?  @relation("AwayTeam", fields: [awayTeamId], references: [id])
+
+  scheduledAt DateTime
+  status      String @default("SCHEDULED")
+
+  homeGoals Int?
+  awayGoals Int?
+
+  homeAvgLevel    Int?
+  awayAvgLevel    Int?
+  // Snapshot of the sum of active-squad player levels at simulation time
+  // (kept alongside the live-computed value shown pre-match in the stadium).
+  homeTotalLevel  Int?
+  awayTotalLevel  Int?
+
+  // Crowd "influence" accumulated via player choreographies before kickoff —
+  // factored into the simulation alongside squad level and home advantage.
+  homeInfluence Float @default(0)
+  awayInfluence Float @default(0)
+
+  // Knockout-bracket bookkeeping (CUPA_INTERNA matches only).
+  // bracketRound: PRELIMINARY | R32 | R16 | QF | SF | F
+  bracketRound  String?
+  nextMatchId   String?
+  nextMatchSlot String? // "HOME" | "AWAY" — which slot of nextMatch the winner fills
+  nextMatch     Match?  @relation("BracketAdvance", fields: [nextMatchId], references: [id])
+  feederMatches Match[] @relation("BracketAdvance")
+  penaltyScore  String? // e.g. "5-4" — set when a knockout tie is resolved on penalties
+  // The winning team for a knockout match — stored explicitly because a
+  // penalty-shootout result can't be re-derived from homeGoals/awayGoals
+  // alone (they can be tied). Null for round-robin (LIGA) matches.
+  winnerTeamId  String?
+
+  simulatedAt     DateTime?
+  events          MatchEvent[]
+  choreographies  Choreography[]
+  predictions     Prediction[]
+  rewards         MatchReward[]
+
+  @@index([leagueId, round])
+  @@index([status, scheduledAt])
+}
+
+// One user's 1/X/2 pick for a match, staked at a flat cash amount determined
+// by the user's level at creation time (src/utils/predictions.js
+// betAmountForLevel). The user may freely change `choice` up until kickoff
+// (no re-charge — see placePrediction). Settled automatically once the
+// match is simulated (src/services/predictionService.js), turning PENDING
+// into WON (with a payout, collectible via POST /:id/collect) or LOST.
+model Prediction {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+  matchId String
+  match   Match  @relation(fields: [matchId], references: [id])
+
+  choice      String // "1" | "X" | "2"
+  stake       Int
+  outcome     String    @default("PENDING")
+  payout      Int? // cash amount collectible once outcome = WON
+  // Set when a SUPERBET event grant is applied to this prediction — the
+  // WON payout is multiplied by this (e.g. 10x). Null / 1 for normal bets.
+  superMultiplier Int?
+  settledAt   DateTime?
+  collectedAt DateTime? // set once the user claims the payout
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, matchId])
+  @@index([userId])
+  @@index([matchId])
+}
+
+// Becomes eligible once per user per (league, calendar day) group of
+// matches, the first time every match the user predicted in that group has
+// been played and every one of their predictions in it came out WON. The
+// user then claims the +1 token via POST /rewards/:id/collect — see
+// src/services/predictionService.js maybeMakeGroupRewardEligible().
+model PredictionReward {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id])
+  leagueId String
+  league   League @relation(fields: [leagueId], references: [id])
+  day      DateTime // local-midnight-truncated date of the group
+
+  eligibleAt  DateTime  @default(now())
+  collectedAt DateTime? // set once the user claims the token
+
+  @@unique([userId, leagueId, day])
+  @@index([userId])
+}
+
+model MatchEvent {
+  id      String         @id @default(cuid())
+  matchId String
+  match   Match          @relation(fields: [matchId], references: [id])
+
+  minute Int
+  type   String @default("GOAL")
+  teamId String
+
+  scorerId String?
+  scorer   User?   @relation("GoalScorer", fields: [scorerId], references: [id])
+
+  assistId String?
+  assistBy User?   @relation("AssistProvider", fields: [assistId], references: [id])
+
+  @@index([matchId])
+}
+
+// Club news-feed post, shown on the player dashboard.
+model Post {
+  id       String  @id @default(cuid())
+  teamId   String
+  team     Team    @relation(fields: [teamId], references: [id])
+  // Null for system-generated posts (currently only TROPHY posts — see
+  // seasonService.js closeOneLeague) — there's no natural "author" for those.
+  authorId String?
+  author   User?   @relation(fields: [authorId], references: [id])
+
+  // TEXT | TROPHY. TROPHY posts render as a celebratory banner on the club
+  // feed (frontend/src/App.jsx Dashboard) instead of a normal text post.
+  type String @default("TEXT")
+  // Set only for type = TROPHY — the trophy the banner celebrates.
+  trophyId String?
+  trophy   Trophy? @relation(fields: [trophyId], references: [id])
+
+  text      String
+  createdAt DateTime @default(now())
+
+  comments  Comment[]
+  reactions PostReaction[]
+
+  @@index([teamId])
+}
+
+// A comment on a club-feed Post. Any member of the post's team may add one;
+// the comment's author (or the team's manager) can delete it. Cascades when
+// the parent post is deleted.
+model Comment {
+  id       String @id @default(cuid())
+  postId   String
+  post     Post   @relation(fields: [postId], references: [id], onDelete: Cascade)
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id])
+
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([postId])
+}
+
+// One player's like / dislike on a Post — unique per (post, user). value is
+// 1 (like) or -1 (dislike); re-sending the same value clears it, the
+// opposite value flips it. Cascades when the parent post is deleted.
+model PostReaction {
+  id     String @id @default(cuid())
+  postId String
+  post   Post   @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  value     Int // 1 = like, -1 = dislike
+  createdAt DateTime @default(now())
+
+  @@unique([postId, userId])
+  @@index([postId])
+}
+
+// Pending post-match payout for a player who contributed crowd influence to
+// a match. Created when the match is simulated (src/services/rewardService.js
+// createMatchRewards), granted when the player taps "Colectează"
+// (POST /api/rewards/match/:id/collect). One row per (user, match).
+model MatchReward {
+  id              String @id @default(cuid())
+  userId          String
+  user            User   @relation(fields: [userId], references: [id])
+  matchId         String
+  match           Match  @relation(fields: [matchId], references: [id])
+
+  competitionType String // LIGA | CUPA_INTERNA | CUPA_CAMPIONILOR | CUPA_INTERNATIONALA
+  cash            Int
+  energy          Int
+  tokens          Int     @default(0) // 1 only for the MVP
+  isMvp           Boolean @default(false)
+  influence       Float   @default(0) // this player's total influence in the match
+
+  createdAt   DateTime  @default(now())
+  collectedAt DateTime?
+
+  @@unique([userId, matchId])
+  @@index([userId, collectedAt])
+}
+
+// Pending level-up payout — created whenever a player's derived level rises
+// (match XP or training), one row per level reached. Granted via
+// POST /api/rewards/levelup/:id/collect, which the client celebrates with
+// the levelup.png card.
+model LevelUpReward {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  level Int // the newly-reached level
+  cash  Int
+  tokens Int
+
+  createdAt   DateTime  @default(now())
+  collectedAt DateTime?
+
+  @@unique([userId, level])
+  @@index([userId, collectedAt])
+}
+
+// End-of-season prize for a top-3 finisher in a league's player influence
+// leaderboard (total Choreography.influence contributed that season).
+// Created in seasonService.closeGlobalSeason, granted from the player feed
+// (POST /api/rewards/season/:id/collect). The player is also given an
+// MVP_LIGA Trophy (tier = rank) at the same time.
+model SeasonInfluenceReward {
+  id           String @id @default(cuid())
+  userId       String
+  user         User   @relation(fields: [userId], references: [id])
+
+  seasonNumber Int
+  leagueId     String
+  leagueName   String
+  rank         Int   // 1 | 2 | 3
+  influence    Float
+  cash         Int
+  tokens       Int
+
+  createdAt   DateTime  @default(now())
+  collectedAt DateTime?
+
+  @@unique([userId, seasonNumber, leagueId])
+  @@index([userId, collectedAt])
+}
+
+// One player's choreography "card" for one match — a grid of cells (color /
+// letter / number), built and paid for by the player, contributing crowd
+// "influence" to their team ahead of kickoff. A player may submit any
+// number of these per match.
+model Choreography {
+  id       String @id @default(cuid())
+  matchId  String
+  match    Match  @relation(fields: [matchId], references: [id])
+  teamId   String
+  team     Team   @relation(fields: [teamId], references: [id])
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id])
+
+  rows      Int
+  cols      Int    @default(10)
+  cellsJson String // JSON-encoded rows x cols grid: null | {type:"color"|"letter"|"number", value:string}
+  cost      Int    // total cash spent (color=10, letter/number=30 per cell)
+  influence Float  // cost * (author level * 0.3) at creation time
+
+  createdAt DateTime @default(now())
+
+  @@index([matchId, teamId])
+  @@index([matchId, authorId])
+}
+
+// A trophy awarded to a team when a LIGA or its CUPA_INTERNA closes
+// (src/services/seasonService.js). Feeds both the club's and its players'
+// trophy cases.
+model Trophy {
+  id              String @id @default(cuid())
+  seasonNumber    Int
+  competitionType String // LIGA | CUPA_INTERNA | CUPA_CAMPIONILOR | CUPA_INTERNATIONALA | SUPERCUPA_NATIONALA | SUPERCUPA_INTERNATIONALA | MVP_LIGA | GHETA_AUR
+  competitionName String // snapshot, e.g. "Premier League" or "Cupa Internă — Premier League"
+
+  // Podium rank for player awards (MVP_LIGA): 1 = gold, 2 = silver, 3 = bronze.
+  // Null for team trophies.
+  tier Int?
+
+  // Snapshot of the source league's `flag` at award time (ISO2 country code
+  // or "INT"), so the trophy case can label it even after the league is
+  // renamed or removed. Null when the league had no flag.
+  countryCode String?
+
+  teamId String
+  team   Team   @relation(fields: [teamId], references: [id])
+
+  players   TrophyPlayer[]
+  posts     Post[]
+  awardedAt DateTime       @default(now())
+
+  @@index([teamId])
+}
+
+// Snapshot of which players were on the winning team's active roster at the
+// moment a Trophy was awarded — keeps their trophy case intact even if they
+// later transfer away.
+model TrophyPlayer {
+  id       String @id @default(cuid())
+  trophyId String
+  trophy   Trophy @relation(fields: [trophyId], references: [id])
+  userId   String
+  user     User   @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([trophyId])
+}
+
+// One frozen record per team per closed LIGA season — powers the club's
+// "istoric sezoane" page. cupResult is one of
+// WINNER | FINALIST | SEMIFINALIST | QUARTERFINALIST | null.
+model TeamSeasonRecord {
+  id             String @id @default(cuid())
+  seasonNumber   Int
+  leagueId       String
+  leagueName     String
+  teamId         String
+  team           Team   @relation(fields: [teamId], references: [id])
+
+  finalPosition  Int?
+  totalInfluence Float  @default(0)
+  starPlayerId   String?
+  starPlayerName String?
+  cupResult      String?
+
+  // Standings snapshot at season close — populated alongside finalPosition,
+  // powers the performance-evolution columns on the club profile's season
+  // history table (frontend/src/ProfilePages.jsx ClubPage).
+  points       Int?
+  wins         Int?
+  draws        Int?
+  losses       Int?
+  goalsFor     Int?
+  goalsAgainst Int?
+
+  createdAt DateTime @default(now())
+
+  @@unique([seasonNumber, teamId])
+  @@index([teamId])
+}
+
+// Singleton (id always 1) — game-wide rules, lazily created with the
+// defaults below on first read (src/services/settingsService.js). Replaces
+// the hardcoded prize constants in seasonService.js and the literal
+// new-league defaults in leagues.controller.js createLeague.
+model GameSettings {
+  id Int @id @default(1)
+
+  leagueWinnerTeamPrize         Int @default(100000)
+  championsQualifyTeamPrize     Int @default(50000)
+  internationalQualifyTeamPrize Int @default(25000)
+  leagueWinnerPlayerBonus       Int @default(500)
+  leaguePlayerMaxCash           Int @default(1000)
+  leaguePlayerMinCash           Int @default(50)
+
+  cupWinnerTeamPrize             Int @default(50000)
+  cupFinalistTeamPrize           Int @default(25000)
+  cupSemifinalistTeamPrize       Int @default(10000)
+  cupQuarterfinalistTeamPrize    Int @default(3000)
+  cupWinnerPlayerBonus           Int @default(500)
+  cupFinalistPlayerPrize         Int @default(500)
+  cupSemifinalistPlayerPrize     Int @default(200)
+  cupQuarterfinalistPlayerPrize  Int @default(100)
+
+  // Continental cups (Cupa Campionilor / Internațională) previously paid out
+  // nothing at all when their final was played — see awardContinentalCupTrophy.
+  championsCupWinnerTeamPrize       Int @default(75000)
+  championsCupWinnerPlayerBonus     Int @default(750)
+  internationalCupWinnerTeamPrize   Int @default(40000)
+  internationalCupWinnerPlayerBonus Int @default(400)
+
+  // Supercups — a single match between last season's winners (see
+  // seasonService.js closeGlobalSeason). Winner-only payout, like the
+  // continental cups.
+  nationalSupercupWinnerTeamPrize        Int @default(30000)
+  nationalSupercupWinnerPlayerBonus      Int @default(300)
+  internationalSupercupWinnerTeamPrize   Int @default(50000)
+  internationalSupercupWinnerPlayerBonus Int @default(500)
+
+  // When competition fixtures land, relative to their league's calendar.
+  // supercupDay: season day the two Supercups are played (day 1 = first
+  // league round). nationalCupStartRound / continentalCupStartRound: the
+  // league round on whose day each knockout's FIRST round is played — every
+  // subsequent knockout round then runs on consecutive days.
+  supercupDay              Int @default(2)
+  nationalCupStartRound    Int @default(5)
+  continentalCupStartRound Int @default(13)
+
+  // Kickoff-hour window for every knockout competition (national cup,
+  // continental cups, both supercups). LIGA round-robin matches keep their
+  // own per-league matchDayStartHour/EndHour.
+  cupMatchDayStartHour Int @default(18)
+  cupMatchDayEndHour   Int @default(22)
+
+  defaultMatchDayStartHour         Int     @default(16)
+  defaultMatchDayEndHour           Int     @default(22)
+  defaultDaysBetweenRounds         Int     @default(1)
+  defaultDoubleRoundRobin          Boolean @default(true)
+  defaultQualifyChampionsSlots     Int     @default(2)
+  defaultQualifyInternationalSlots Int     @default(2)
+
+  updatedAt DateTime @updatedAt
+}
+
+// Immutable snapshot of one competition's final result for one season —
+// one row per LIGA/CUPA_INTERNA/CUPA_CAMPIONILOR/CUPA_INTERNATIONALA closed.
+// Written once, at close time (seasonService.js archiveCompetition), and
+// never recomputed live — survives independent of raw Match data later.
+model SeasonArchive {
+  id               String   @id @default(cuid())
+  seasonNumber     Int
+  leagueId         String
+  leagueName       String
+  leagueType       String
+  championTeamId   String?
+  championTeamName String?
+  closedAt         DateTime @default(now())
+
+  standings  SeasonArchiveStanding[]
+  topScorers SeasonArchiveScorer[]
+
+  @@unique([seasonNumber, leagueId])
+  @@index([seasonNumber])
+}
+
+// For a LIGA archive: a real standings row (played/wins/draws/losses/goals/
+// points). For a knockout-cup archive: position encodes the bracket tier
+// (1=champion, 2=finalist, 3+=semi/quarterfinalists) and the W/D/L/goal
+// fields stay null — there's no group-stage table for a cup.
+model SeasonArchiveStanding {
+  id        String        @id @default(cuid())
+  archiveId String
+  archive   SeasonArchive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  position Int
+  teamId   String
+  teamName String
+
+  played       Int?
+  wins         Int?
+  draws        Int?
+  losses       Int?
+  goalsFor     Int?
+  goalsAgainst Int?
+  points       Int?
+
+  @@index([archiveId])
+}
+
+model SeasonArchiveScorer {
+  id        String        @id @default(cuid())
+  archiveId String
+  archive   SeasonArchive @relation(fields: [archiveId], references: [id], onDelete: Cascade)
+
+  userId     String?
+  playerName String
+  teamId     String?
+  teamName   String
+  goals      Int
+  assists    Int
+
+  @@index([archiveId])
+}
+
+// ---------------------------------------------------------------------------
+// TRANSFERS
+// ---------------------------------------------------------------------------
+// Recruitment between clubs. Two entry points, both resolved by the target
+// player accepting an offer in their feed (src/services/transferService.js):
+//   FREE_AGENT — a manager proposes to a player with no club (fee 0).
+//   PURCHASE   — a manager buys a player another club has put on the market
+//                (TransferListing); on accept, `fee` moves buyer→seller budget.
+// A completed move is written once to `Transfer` (immutable public log).
+
+model TransferListing {
+  id                String    @id @default(cuid())
+  playerId          String
+  player            User      @relation("ListingPlayer", fields: [playerId], references: [id])
+  fromTeamId        String
+  fromTeam          Team      @relation("ListingFromTeam", fields: [fromTeamId], references: [id])
+  listedByManagerId String
+  listedByManager   User      @relation("ListingManager", fields: [listedByManagerId], references: [id])
+
+  price     Int
+  status    String    @default("LISTED") // LISTED | SOLD | WITHDRAWN
+  toTeamId  String?
+  toTeam    Team?     @relation("ListingToTeam", fields: [toTeamId], references: [id])
+  soldPrice Int?
+
+  createdAt DateTime  @default(now())
+  soldAt    DateTime?
+
+  offers TransferOffer[]
+
+  @@index([status])
+  @@index([fromTeamId])
+}
+
+model TransferOffer {
+  id           String @id @default(cuid())
+  kind         String // FREE_AGENT | PURCHASE
+
+  targetUserId String
+  targetUser   User   @relation("OfferTarget", fields: [targetUserId], references: [id])
+
+  toTeamId String
+  toTeam   Team   @relation("OfferToTeam", fields: [toTeamId], references: [id])
+
+  fromTeamId String?
+  fromTeam   Team?   @relation("OfferFromTeam", fields: [fromTeamId], references: [id])
+
+  fromManagerId String
+  fromManager   User   @relation("OfferManager", fields: [fromManagerId], references: [id])
+
+  listingId String?
+  listing   TransferListing? @relation(fields: [listingId], references: [id])
+
+  fee    Int    @default(0)
+  status String @default("PENDING") // PENDING | ACCEPTED | DECLINED | CANCELLED | EXPIRED
+
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([targetUserId, status])
+  @@index([toTeamId, status])
+}
+
+model Transfer {
+  id       String @id @default(cuid())
+  playerId String
+  player   User   @relation("TransferPlayer", fields: [playerId], references: [id])
+
+  fromTeamId String?
+  fromTeam   Team?   @relation("TransferFromTeam", fields: [fromTeamId], references: [id])
+  toTeamId   String
+  toTeam     Team    @relation("TransferToTeam", fields: [toTeamId], references: [id])
+
+  fee  Int    @default(0)
+  kind String @default("MARKET") // MARKET | OFFER
+
+  createdAt DateTime @default(now())
+
+  @@index([playerId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// MANAGER ELECTION POLL
+// ---------------------------------------------------------------------------
+// Any squad member can open one poll per team proposing a teammate as the
+// club's manager. Every non-bot squad member gets one vote; after 24h the
+// poll auto-resolves (src/jobs/managerPollJob.js → managerPollService):
+// if YES / (YES + NO) >= 51% the candidate becomes MANAGER and the previous
+// manager is demoted to PLAYER. One manager per team.
+
+model ManagerPoll {
+  id          String @id @default(cuid())
+  teamId      String
+  team        Team   @relation("TeamManagerPolls", fields: [teamId], references: [id])
+  candidateId String
+  candidate   User   @relation("PollCandidate", fields: [candidateId], references: [id])
+  startedById String
+  startedBy   User   @relation("PollStarter", fields: [startedById], references: [id])
+
+  status String @default("OPEN") // OPEN | PASSED | FAILED | CANCELLED
+
+  createdAt  DateTime  @default(now())
+  closesAt   DateTime
+  resolvedAt DateTime?
+
+  votes ManagerPollVote[]
+
+  @@index([teamId, status])
+  @@index([status, closesAt])
+}
+
+model ManagerPollVote {
+  id      String      @id @default(cuid())
+  pollId  String
+  poll    ManagerPoll @relation(fields: [pollId], references: [id])
+  voterId String
+  voter   User        @relation("PollVotes", fields: [voterId], references: [id])
+  choice  String      // YES | NO
+
+  createdAt DateTime @default(now())
+
+  @@unique([pollId, voterId])
+}
+
+// ---------------------------------------------------------------------------
+// EVENTS (Evenimente)
+// ---------------------------------------------------------------------------
+// Admin-triggered, time-boxed events. While one is ACTIVE (now within
+// [startsAt, endsAt]) it either changes a game mechanic for everyone (the
+// "double X" multipliers, faster energy regen) or unlocks a per-player
+// one-off action (reward wheel, paid position change, superbet). Per-type
+// tunables live in configJson, merged over the registry defaults in
+// src/services/eventsService.js. Status transitions are advanced lazily on
+// read and by src/jobs/eventsJob.js.
+model GameEvent {
+  id          String   @id @default(cuid())
+  type        String   // see EventType in the enum notes above
+  status      String   @default("SCHEDULED") // SCHEDULED | ACTIVE | ENDED | CANCELLED
+  startsAt    DateTime
+  endsAt      DateTime
+  configJson  String   @default("{}")
+
+  createdById String?
+  createdBy   User?    @relation("EventCreator", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  claims GameEventClaim[]
+
+  @@index([status, endsAt])
+  @@index([type, status])
+}
+
+// One player's interaction with a specific event instance: a reward-wheel
+// spin (rate-limited by a cooldown), a superbet grant / its use, or a paid
+// position change. dataJson carries the payload (prize won, target matchId,
+// old/new position, …).
+model GameEventClaim {
+  id      String    @id @default(cuid())
+  eventId String
+  event   GameEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User      @relation("EventClaims", fields: [userId], references: [id])
+
+  kind     String   // WHEEL_SPIN | SUPERBET_GRANT | SUPERBET_USED | POSITION_CHANGE
+  dataJson String   @default("{}")
+
+  createdAt DateTime @default(now())
+
+  @@index([eventId, userId, kind])
+  @@index([userId, kind])
+}
+
+// A message sent from the in-app "Contact" form. Any authenticated user can
+// create one; admins read every submission under the "Formulare" panel and
+// move it NEW → READ → RESOLVED. Author snapshot (name/email) is copied in so
+// the row still makes sense if the account is later removed.
+model ContactMessage {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation("ContactAuthor", fields: [userId], references: [id])
+
+  name    String
+  email   String
+  topic   String  @default("GENERAL") // GENERAL | BUG | ACCOUNT | PAYMENT | OTHER
+  subject String
+  message String
+
+  status    String    @default("NEW") // NEW | READ | RESOLVED
+  handledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+// Player-facing "Update log" (changelog). Seeded from the built-in version
+// history; admins add/edit entries under the admin panel's "Actualizări" tab.
+// `translations` is a JSON string keyed by language code — each value is
+// { title, intro, items:[{ type: "new"|"improved"|"fixed", text }] }. The
+// public endpoint resolves it to the requested language (falls back en → ro
+// → first available). `releaseDate` is free display text (e.g. "30 aug. 2026").
+model ChangelogEntry {
+  id          String  @id @default(cuid())
+  version     String  @unique
+  releaseDate String
+  published   Boolean @default(true)
+  sortKey     Int     @default(0) // higher = newer; primary ordering key
+
+  translations String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([published, sortKey])
+}
+
+// ---------------------------------------------------------------------------
+// SHOP — REAL-MONEY PURCHASES (Stripe Checkout)
+// ---------------------------------------------------------------------------
+// One row per Stripe Checkout Session created for a real-money shop item
+// (energy pack, cash pack, the "Super Value" bundle, or the one-time Starter
+// Pack — src/controllers/players.controller.js ENERGY_PACKS/CURRENCY_PACKS/
+// SHOP_BUNDLE/STARTER_PACK). Created PENDING when the session is opened;
+// fulfilled (resources granted, status -> PAID) only from the Stripe webhook
+// handler (src/controllers/stripeWebhook.controller.js) once payment is
+// confirmed — never from the browser returning to the success page. The
+// unique Stripe session id makes fulfillment idempotent against Stripe's
+// at-least-once webhook delivery.
+model ShopOrder {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  kind   String // energy | currency | bundle | starter
+  packId String // catalog id, e.g. "energy_250" | "bundle_super" | "starter_pack"
+
+  currency     String @default("eur")
+  amountTotal  Int    // charged amount, in the smallest currency unit (cents)
+
+  // Resources granted on fulfillment — snapshotted at session-creation time
+  // from the catalog, so a later catalog/price change never alters an
+  // in-flight order.
+  grantCash   Int @default(0)
+  grantEnergy Int @default(0)
+  grantTokens Int @default(0)
+
+  stripeCheckoutSessionId String  @unique
+  stripePaymentIntentId   String?
+
+  status String @default("PENDING") // PENDING | PAID | FAILED | EXPIRED
+
+  createdAt   DateTime  @default(now())
+  fulfilledAt DateTime?
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// FRIENDS & DIRECT MESSAGES
+// ---------------------------------------------------------------------------
+// One row per friendship, keyed by (requester, addressee). `status` is PENDING
+// until the addressee accepts, then ACCEPTED. Removing a friend, cancelling a
+// sent request, or declining a received one all simply delete the row.
+// "Are they friends?" = a row with status ACCEPTED in either direction.
+model Friendship {
+  id          String    @id @default(cuid())
+  requesterId String
+  requester   User      @relation("FriendRequester", fields: [requesterId], references: [id])
+  addresseeId String
+  addressee   User      @relation("FriendAddressee", fields: [addresseeId], references: [id])
+  status      String    @default("PENDING") // PENDING | ACCEPTED
+  createdAt   DateTime  @default(now())
+  respondedAt DateTime?
+
+  @@unique([requesterId, addresseeId])
+  @@index([addresseeId, status])
+  @@index([requesterId, status])
+}
+
+// One direct message between two users. "Delete conversation" is a per-side
+// soft delete: the caller's flag is set on every message in the pair, so the
+// thread disappears from their Messages list while the other user keeps it.
+// A later message is a fresh row (both flags false), so the thread reappears
+// for the side that had cleared it — only with the new messages.
+model DirectMessage {
+  id                 String    @id @default(cuid())
+  senderId           String
+  sender             User      @relation("DMSender", fields: [senderId], references: [id])
+  recipientId        String
+  recipient          User      @relation("DMRecipient", fields: [recipientId], references: [id])
+  body               String
+  readAt             DateTime?
+  deletedBySender    Boolean   @default(false)
+  deletedByRecipient Boolean   @default(false)
+  createdAt          DateTime  @default(now())
+
+  @@index([senderId, recipientId, createdAt])
+  @@index([recipientId, readAt])
+}
+
+// One invite that paid (or will pay) off. Created PENDING when a new account
+// signs up through someone's invite link; flips to COMPLETED once that account
+// verifies its email (social accounts are verified at creation, so they
+// complete immediately), at which point the referrer is granted `rewardTokens`.
+// `referredId` is unique — an account can only ever be referred once.
+model Referral {
+  id           String    @id @default(cuid())
+  referrerId   String
+  referrer     User      @relation("ReferralReferrer", fields: [referrerId], references: [id])
+  referredId   String    @unique
+  referred     User      @relation("ReferralReferred", fields: [referredId], references: [id])
+  status       String    @default("PENDING") // PENDING | COMPLETED
+  rewardTokens Int       @default(25)
+  createdAt    DateTime  @default(now())
+  completedAt  DateTime?
+
+  @@index([referrerId, status])
+}

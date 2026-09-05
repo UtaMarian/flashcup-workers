@@ -17,35 +17,40 @@ scales horizontally, the jobs must run from **exactly one instance**.
 ## How the shared code works
 
 The jobs reuse the backend's domain logic (match simulation, event lifecycle,
-manager polls, the Prisma client, the logger). Rather than duplicating it, the
-`flashleague` repo is vendored as a **git submodule** at `vendor/flashleague`,
-and [`src/shared.js`](src/shared.js) is the single module that reaches into it.
-`npm install`'s `postinstall` runs `prisma generate` against the submodule's
+manager polls, the Prisma client, the logger). Rather than reimplement it, a
+slice of `flashleague-backend` is **vendored** into
+`vendor/flashleague/flashleague-backend/` as plain files, and
+[`src/shared.js`](src/shared.js) is the single module that reaches into it.
+`npm install`'s `postinstall` runs `prisma generate` against the vendored
 `prisma/schema.prisma`.
 
+> Vendored as plain files (not a git submodule) because PaaS builders such as
+> Render don't reliably clone private submodules.
+
 > **Keep `@prisma/client` in lockstep with the backend** (`vendor/flashleague/flashleague-backend/package.json`). A mismatch breaks the generated client.
+
+### Re-syncing the vendored backend
+
+When `flashleague-backend` changes, refresh the copy from a checkout of the
+monorepo:
+
+```bash
+rm -rf vendor/flashleague/flashleague-backend
+mkdir -p vendor/flashleague/flashleague-backend
+git -C /path/to/flashleague/flashleague-backend archive HEAD \
+  | tar -x -C vendor/flashleague/flashleague-backend
+rm -rf vendor/flashleague/flashleague-backend/prisma/migrations_sqlite_backup
+git add vendor && git commit -m "Re-sync vendored backend"
+```
 
 ## Local development
 
 ```bash
-git clone --recurse-submodules https://github.com/UtaMarian/flashcup-workers.git
+git clone https://github.com/UtaMarian/flashcup-workers.git
 cd flashcup-workers
 npm install                      # also generates the Prisma client
 cp .env.example .env             # set DATABASE_URL / DIRECT_URL to the SAME db as the API
 npm start                        # runs the 4 cron jobs
-```
-
-Already cloned without `--recurse-submodules`:
-
-```bash
-git submodule update --init --recursive
-```
-
-Pull a newer backend into the submodule (then commit the bump):
-
-```bash
-git submodule update --remote vendor/flashleague
-git add vendor/flashleague && git commit -m "Bump flashleague submodule"
 ```
 
 ## Deployment
@@ -82,8 +87,9 @@ Environment variables:
 | `DIRECT_URL` | Neon's *unpooled* string. Not used at runtime here (no migrations), but the shared Prisma schema references it. Anywhere else: same value as `DATABASE_URL`. |
 | `NODE_ENV` | `production` (plain JSON logs; skips `pino-pretty`) |
 
-Render auto-runs `git submodule update --init --recursive`, so `vendor/flashleague`
-is fetched automatically.
+The vendored backend is committed in this repo, so the build needs no extra
+fetch step. **Set the build command to `npm install`** (Render's Node default
+is `yarn`, which ignores `package-lock.json`).
 
 > ⚠ Render's **free** web tier spins the service down after ~15 min without
 > inbound traffic, which stops the cron jobs. Keep it awake with an external
