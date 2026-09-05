@@ -57,3 +57,35 @@ git add vendor/flashleague && git commit -m "Bump flashleague submodule"
   docker compose --profile worker up -d
   ```
 - **Run one replica only.** `node-cron` has no leader-election; a second worker double-runs every timed action.
+
+### Render
+
+`render.yaml` is included. The jobs are a background process, so the natural
+Render type is a **Background Worker** (paid). To use the **free Web Service**
+tier instead, `src/worker.js` also binds `$PORT` with a `/` health endpoint.
+
+Settings if creating the service by hand:
+
+| Field | Value |
+|---|---|
+| Type | Web Service (free) — or Background Worker (paid, no HTTP) |
+| Runtime | Node |
+| Build command | `npm install` (runs `postinstall` → `prisma generate`) |
+| Start command | `npm start` |
+| Health check path | `/` |
+
+Environment variables:
+
+| Key | Value |
+|---|---|
+| `DATABASE_URL` | **the same database the Flash Cup API uses** — Neon's *pooled* connection string |
+| `DIRECT_URL` | Neon's *unpooled* string; anywhere else, set it equal to `DATABASE_URL` |
+| `NODE_ENV` | `production` (plain JSON logs; skips `pino-pretty`) |
+
+Render auto-runs `git submodule update --init --recursive`, so `vendor/flashleague`
+is fetched automatically.
+
+> ⚠ Render's **free** web tier spins the service down after ~15 min without
+> inbound traffic, which stops the cron jobs. Keep it awake with an external
+> ping to the service URL every ~10 min (e.g. cron-job.org), or use a paid
+> instance (no spin-down).

@@ -1,0 +1,48 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# The cron jobs are a background process. The "correct" Render type is a
+# Background Worker (see the commented block at the bottom), but that needs a
+# paid instance. This default runs it as a Web Service instead: worker.js
+# binds $PORT with a tiny /health endpoint so Render's health check passes.
+#
+# ⚠  Render's FREE web tier spins the service down after ~15 min with no
+#    inbound traffic — which would stop the cron jobs. On free, keep it awake
+#    by pinging the service URL every ~10 min (e.g. a free cron-job.org job).
+#    On a paid instance ("starter" or above) there is no spin-down.
+#
+# Render auto-runs `git submodule update --init --recursive`, so vendor/flashleague
+# is fetched automatically (public HTTPS submodule).
+
+services:
+  - type: web
+    name: flashcup-workers
+    runtime: node
+    plan: free                 # change to "starter" to remove the idle spin-down
+    branch: main
+    buildCommand: npm install  # runs postinstall -> prisma generate
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL      # SAME database the Flash Cup API uses (pooled string on Neon)
+        sync: false
+      - key: DIRECT_URL        # unpooled string on Neon; else = DATABASE_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
+
+  # --- Alternative: Background Worker (paid, no HTTP, no spin-down) ---------
+  # - type: worker
+  #   name: flashcup-workers
+  #   runtime: node
+  #   plan: starter
+  #   branch: main
+  #   buildCommand: npm install
+  #   startCommand: npm start
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       sync: false
+  #     - key: DIRECT_URL
+  #       sync: false
+  #     - key: NODE_ENV
+  #       value: production
