@@ -4,45 +4,108 @@ const { betAmountForLevel, truncateToDay } = require("../utils/predictions");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAY_OFFSET = { yesterday: -1, today: 0, tomorrow: 1 };
 
-// National competitions are only relevant to the teams playing in them, so
-// the board only shows those matches when the caller's own team is involved.
-// International competitions are shown to every player.
-const NATIONAL_TYPES = new Set(["LIGA", "CUPA_INTERNA", "SUPERCUPA_NATIONALA"]);
+// Resolves ?day=yesterday|today|tomorrow to a [start, end) local-day window.
+// Returns null for an invalid value.
+function dayWindow(dayParam) {
+  const offset = DAY_OFFSET[dayParam];
+  if (offset === undefined) return null;
+  const start = new Date(truncateToDay(new Date()).getTime() + offset * DAY_MS);
+  return { start, end: new Date(start.getTime() + DAY_MS) };
+}
 
 // GET /api/predictions/board?day=yesterday|today|tomorrow
-// Every match scheduled on the given calendar day, grouped by league/cup,
-// annotated with the caller's own prediction (if any) per match and their
-// token-reward progress per group. The group's progress bar tracks WON
-// predictions (not just placed ones) — it only reaches 100% once every
-// match in the group has been predicted AND guessed correctly, which is
-// exactly the condition that makes the token collectible.
+// Lightweight index of the day's competitions — every league/cup with at
+// least one match scheduled that day, plus the caller's WON/total progress
+// and token-reward state per competition. Deliberately carries NO match or
+// team detail: the client hydrates each competition's rows separately via
+// GET /board/:leagueId, so the page paints fast and the DB is hit with one
+// small query per competition instead of a single heavy join.
 async function getBoard(req, res, next) {
   try {
     const dayParam = req.query.day || "today";
-    const offset = DAY_OFFSET[dayParam];
-    if (offset === undefined) return res.status(400).json({ error: "Parametru 'day' invalid — acceptate: yesterday, today, tomorrow." });
-
-    const start = new Date(truncateToDay(new Date()).getTime() + offset * DAY_MS);
-    const end = new Date(start.getTime() + DAY_MS);
+    const win = dayWindow(dayParam);
+    if (!win) return res.status(400).json({ error: "Parametru 'day' invalid — acceptate: yesterday, today, tomorrow." });
 
     const user = req.user;
 
-    const allMatches = await prisma.match.findMany({
-      where: { scheduledAt: { gte: start, lt: end } },
-      include: {
-        homeTeam: { include: { players: { select: { level: true, status: true } } } },
-        awayTeam: { include: { players: { select: { level: true, status: true } } } },
-        league: true,
+    const matches = await prisma.match.findMany({
+      where: { scheduledAt: { gte: win.start, lt: win.end } },
+      select: {
+        id: true,
+        leagueId: true,
+        league: { select: { id: true, name: true, type: true, flag: true } },
       },
       orderBy: [{ leagueId: "asc" }, { scheduledAt: "asc" }],
     });
 
-    // National competitions (campionat, cupă/supercupă națională) only show up
-    // for the two teams involved; international competitions show for everyone.
-    const matches = allMatches.filter((m) => {
-      if (!NATIONAL_TYPES.has(m.league?.type)) return true;
-      return !!user.teamId && (m.homeTeamId === user.teamId || m.awayTeamId === user.teamId);
+    if (!matches.length) {
+      return res.json({ day: dayParam, stake: betAmountForLevel(user.level), groups: [] });
+    }
+
+    const matchIds = matches.map(m => m.id);
+    const leagueIds = [...new Set(matches.map(m => m.leagueId))];
+
+    const [myPredictions, rewards] = await Promise.all([
+      prisma.prediction.findMany({
+        where: { userId: user.id, matchId: { in: matchIds } },
+        select: { matchId: true, outcome: true },
+      }),
+      prisma.predictionReward.findMany({
+        where: { userId: user.id, leagueId: { in: leagueIds }, day: win.start },
+        select: { id: true, milestone: true, collectedAt: true, leagueId: true },
+      }),
+    ]);
+    const outcomeByMatch = Object.fromEntries(myPredictions.map(p => [p.matchId, p.outcome]));
+    const rewardsByLeague = {};
+    for (const r of rewards) (rewardsByLeague[r.leagueId] ||= []).push(r);
+
+    const byLeague = {};
+    for (const m of matches) {
+      const g = (byLeague[m.leagueId] ||= { league: m.league, total: 0, won: 0 });
+      g.total++;
+      if (outcomeByMatch[m.id] === "WON") g.won++;
+    }
+
+    const groups = Object.values(byLeague).map(g => ({
+      league: { id: g.league.id, name: g.league.name, type: g.league.type, flag: g.league.flag || null },
+      progress: { won: g.won, total: g.total },
+      rewards: (rewardsByLeague[g.league.id] || [])
+        .sort((a, b) => a.milestone - b.milestone)
+        .map(r => ({ id: r.id, milestone: r.milestone, collected: !!r.collectedAt })),
+    }));
+
+    res.json({ day: dayParam, stake: betAmountForLevel(user.level), groups });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/predictions/board/:leagueId?day=yesterday|today|tomorrow
+// The rows for ONE competition on the given day — team crests, squad-level
+// totals, crowd influence and the caller's own prediction per match. Called
+// once per competition by the client, right after GET /board.
+async function getBoardGroup(req, res, next) {
+  try {
+    const dayParam = req.query.day || "today";
+    const win = dayWindow(dayParam);
+    if (!win) return res.status(400).json({ error: "Parametru 'day' invalid — acceptate: yesterday, today, tomorrow." });
+
+    const user = req.user;
+    const { leagueId } = req.params;
+
+    const matches = await prisma.match.findMany({
+      where: { leagueId, scheduledAt: { gte: win.start, lt: win.end } },
+      include: {
+        homeTeam: { include: { players: { select: { level: true, status: true } } } },
+        awayTeam: { include: { players: { select: { level: true, status: true } } } },
+      },
+      orderBy: { scheduledAt: "asc" },
     });
+
+    const myPredictions = matches.length
+      ? await prisma.prediction.findMany({ where: { userId: user.id, matchId: { in: matches.map(m => m.id) } } })
+      : [];
+    const predictionByMatch = Object.fromEntries(myPredictions.map(p => [p.matchId, p]));
 
     const sumActiveLevels = (team) =>
       (team?.players || []).filter(p => p.status === "ACTIVE").reduce((s, p) => s + p.level, 0);
@@ -52,66 +115,33 @@ async function getBoard(req, res, next) {
       return rest;
     };
 
-    const matchIds = matches.map(m => m.id);
-    const leagueIds = [...new Set(matches.map(m => m.leagueId))];
-
-    const [myPredictions, rewards] = await Promise.all([
-      matchIds.length ? prisma.prediction.findMany({ where: { userId: user.id, matchId: { in: matchIds } } }) : [],
-      leagueIds.length ? prisma.predictionReward.findMany({ where: { userId: user.id, leagueId: { in: leagueIds }, day: start } }) : [],
-    ]);
-    const predictionByMatch = Object.fromEntries(myPredictions.map(p => [p.matchId, p]));
-    // All token rewards for this (league, day), keyed by league — a group can
-    // now have several: the milestone:0 "all-in" bonus plus 5/10/15… thresholds.
-    const rewardsByLeague = {};
-    for (const r of rewards) (rewardsByLeague[r.leagueId] ||= []).push(r);
-
-    const groupsByLeague = {};
-    for (const m of matches) {
-      if (!groupsByLeague[m.leagueId]) groupsByLeague[m.leagueId] = { league: m.league, matches: [] };
-      groupsByLeague[m.leagueId].matches.push(m);
-    }
-
     const now = new Date();
-    const groups = Object.values(groupsByLeague).map(g => {
-      const total = g.matches.length;
-      const won = g.matches.filter(m => predictionByMatch[m.id]?.outcome === "WON").length;
-      const groupRewards = (rewardsByLeague[g.league.id] || [])
-        .sort((a, b) => a.milestone - b.milestone)
-        .map(r => ({ id: r.id, milestone: r.milestone, collected: !!r.collectedAt }));
-
+    const rows = matches.map(m => {
+      const mine = predictionByMatch[m.id];
+      const played = m.status === "PLAYED";
       return {
-        league: { id: g.league.id, name: g.league.name, type: g.league.type, flag: g.league.flag || null },
-        progress: { won, total },
-        rewards: groupRewards,
-        matches: g.matches.map(m => {
-          const mine = predictionByMatch[m.id];
-          const played = m.status === "PLAYED";
-          return {
-            id: m.id,
-            round: m.round,
-            scheduledAt: m.scheduledAt,
-            status: m.status,
-            homeTeam: stripTeam(m.homeTeam),
-            awayTeam: stripTeam(m.awayTeam),
-            homeGoals: m.homeGoals,
-            awayGoals: m.awayGoals,
-            // Crowd influence + squad-level totals, for the row's hover peek.
-            homeInfluence: m.homeInfluence,
-            awayInfluence: m.awayInfluence,
-            homeTotalLevel: played ? (m.homeTotalLevel ?? 0) : sumActiveLevels(m.homeTeam),
-            awayTotalLevel: played ? (m.awayTotalLevel ?? 0) : sumActiveLevels(m.awayTeam),
-            myPrediction: mine ? {
-              id: mine.id, choice: mine.choice, stake: mine.stake, outcome: mine.outcome,
-              payout: mine.payout, collected: !!mine.collectedAt,
-              superMultiplier: mine.superMultiplier || null,
-            } : null,
-            locked: m.status !== "SCHEDULED" || !m.homeTeamId || !m.awayTeamId || new Date(m.scheduledAt) <= now,
-          };
-        }),
+        id: m.id,
+        round: m.round,
+        scheduledAt: m.scheduledAt,
+        status: m.status,
+        homeTeam: stripTeam(m.homeTeam),
+        awayTeam: stripTeam(m.awayTeam),
+        homeGoals: m.homeGoals,
+        awayGoals: m.awayGoals,
+        homeInfluence: m.homeInfluence,
+        awayInfluence: m.awayInfluence,
+        homeTotalLevel: played ? (m.homeTotalLevel ?? 0) : sumActiveLevels(m.homeTeam),
+        awayTotalLevel: played ? (m.awayTotalLevel ?? 0) : sumActiveLevels(m.awayTeam),
+        myPrediction: mine ? {
+          id: mine.id, choice: mine.choice, stake: mine.stake, outcome: mine.outcome,
+          payout: mine.payout, collected: !!mine.collectedAt,
+          superMultiplier: mine.superMultiplier || null,
+        } : null,
+        locked: m.status !== "SCHEDULED" || !m.homeTeamId || !m.awayTeamId || new Date(m.scheduledAt) <= now,
       };
     });
 
-    res.json({ day: dayParam, stake: betAmountForLevel(user.level), groups });
+    res.json({ leagueId, matches: rows });
   } catch (err) {
     next(err);
   }
@@ -235,4 +265,4 @@ async function collectReward(req, res, next) {
   }
 }
 
-module.exports = { getBoard, placePrediction, cancelPrediction, collectPrediction, collectReward };
+module.exports = { getBoard, getBoardGroup, placePrediction, cancelPrediction, collectPrediction, collectReward };
