@@ -22,6 +22,7 @@ const contactRoutes = require("./routes/contact.routes");
 const changelogRoutes = require("./routes/changelog.routes");
 const chatRoutes = require("./routes/chat.routes");
 const referralRoutes = require("./routes/referrals.routes");
+const announcementsRoutes = require("./routes/announcements.routes");
 const { handleStripeWebhook } = require("./controllers/stripeWebhook.controller");
 
 const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
@@ -73,6 +74,7 @@ app.use("/api/contact", contactRoutes);
 app.use("/api/changelog", changelogRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/referrals", referralRoutes);
+app.use("/api/announcements", announcementsRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

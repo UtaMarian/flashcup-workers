@@ -199,6 +199,9 @@ model User {
 
   shopOrders ShopOrder[]
 
+  // Game-wide announcements this (admin) user posted — see model Announcement.
+  announcementsAuthored Announcement[] @relation("AnnouncementAuthor")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -448,11 +451,15 @@ model Prediction {
   @@index([matchId])
 }
 
-// Becomes eligible once per user per (league, calendar day) group of
-// matches, the first time every match the user predicted in that group has
-// been played and every one of their predictions in it came out WON. The
-// user then claims the +1 token via POST /rewards/:id/collect — see
-// src/services/predictionService.js maybeMakeGroupRewardEligible().
+// A claimable +1 token from predictions, one row per milestone reached in a
+// (league, calendar day) group. `milestone` distinguishes them:
+//   0        — the "all-in" bonus: every match the user predicted in that
+//              group has been played and every one of their picks came out
+//              WON (any competition type).
+//   5,10,15… — LIGA (campionat) only: +1 token for every 5 WON picks in the
+//              group, regardless of whether all matches were predicted.
+// The user claims each via POST /rewards/:id/collect — see
+// src/services/predictionService.js.
 model PredictionReward {
   id       String @id @default(cuid())
   userId   String
@@ -461,10 +468,12 @@ model PredictionReward {
   league   League @relation(fields: [leagueId], references: [id])
   day      DateTime // local-midnight-truncated date of the group
 
+  milestone Int @default(0) // 0 = all-in bonus; 5,10,… = per-5-wins threshold (LIGA)
+
   eligibleAt  DateTime  @default(now())
   collectedAt DateTime? // set once the user claims the token
 
-  @@unique([userId, leagueId, day])
+  @@unique([userId, leagueId, day, milestone])
   @@index([userId])
 }
 
@@ -543,6 +552,25 @@ model PostReaction {
 
   @@unique([postId, userId])
   @@index([postId])
+}
+
+// Game-wide announcement written by an admin from the admin panel. Unlike a
+// Post (which belongs to one club's feed), an Announcement is shown on every
+// player's dashboard feed regardless of team. `active` toggles visibility
+// without deleting the row.
+model Announcement {
+  id       String  @id @default(cuid())
+  authorId String?
+  author   User?   @relation("AnnouncementAuthor", fields: [authorId], references: [id])
+
+  title  String?
+  text   String
+  active Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active, createdAt])
 }
 
 // Pending post-match payout for a player who contributed crowd influence to

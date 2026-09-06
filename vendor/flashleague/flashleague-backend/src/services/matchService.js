@@ -171,6 +171,7 @@ async function simulateAndPersistMatch(matchId) {
   await settlePredictionsForMatch({
     id: match.id,
     leagueId: match.leagueId,
+    leagueType: match.league?.type,
     scheduledAt: match.scheduledAt,
     homeGoals: result.homeGoals,
     awayGoals: result.awayGoals,

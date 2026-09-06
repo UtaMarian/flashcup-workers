@@ -4,6 +4,11 @@ const { betAmountForLevel, truncateToDay } = require("../utils/predictions");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAY_OFFSET = { yesterday: -1, today: 0, tomorrow: 1 };
 
+// National competitions are only relevant to the teams playing in them, so
+// the board only shows those matches when the caller's own team is involved.
+// International competitions are shown to every player.
+const NATIONAL_TYPES = new Set(["LIGA", "CUPA_INTERNA", "SUPERCUPA_NATIONALA"]);
+
 // GET /api/predictions/board?day=yesterday|today|tomorrow
 // Every match scheduled on the given calendar day, grouped by league/cup,
 // annotated with the caller's own prediction (if any) per match and their
@@ -20,7 +25,9 @@ async function getBoard(req, res, next) {
     const start = new Date(truncateToDay(new Date()).getTime() + offset * DAY_MS);
     const end = new Date(start.getTime() + DAY_MS);
 
-    const matches = await prisma.match.findMany({
+    const user = req.user;
+
+    const allMatches = await prisma.match.findMany({
       where: { scheduledAt: { gte: start, lt: end } },
       include: {
         homeTeam: { include: { players: { select: { level: true, status: true } } } },
@@ -28,6 +35,13 @@ async function getBoard(req, res, next) {
         league: true,
       },
       orderBy: [{ leagueId: "asc" }, { scheduledAt: "asc" }],
+    });
+
+    // National competitions (campionat, cupă/supercupă națională) only show up
+    // for the two teams involved; international competitions show for everyone.
+    const matches = allMatches.filter((m) => {
+      if (!NATIONAL_TYPES.has(m.league?.type)) return true;
+      return !!user.teamId && (m.homeTeamId === user.teamId || m.awayTeamId === user.teamId);
     });
 
     const sumActiveLevels = (team) =>
@@ -38,7 +52,6 @@ async function getBoard(req, res, next) {
       return rest;
     };
 
-    const user = req.user;
     const matchIds = matches.map(m => m.id);
     const leagueIds = [...new Set(matches.map(m => m.leagueId))];
 
@@ -47,7 +60,10 @@ async function getBoard(req, res, next) {
       leagueIds.length ? prisma.predictionReward.findMany({ where: { userId: user.id, leagueId: { in: leagueIds }, day: start } }) : [],
     ]);
     const predictionByMatch = Object.fromEntries(myPredictions.map(p => [p.matchId, p]));
-    const rewardByLeague = Object.fromEntries(rewards.map(r => [r.leagueId, r]));
+    // All token rewards for this (league, day), keyed by league — a group can
+    // now have several: the milestone:0 "all-in" bonus plus 5/10/15… thresholds.
+    const rewardsByLeague = {};
+    for (const r of rewards) (rewardsByLeague[r.leagueId] ||= []).push(r);
 
     const groupsByLeague = {};
     for (const m of matches) {
@@ -59,12 +75,14 @@ async function getBoard(req, res, next) {
     const groups = Object.values(groupsByLeague).map(g => {
       const total = g.matches.length;
       const won = g.matches.filter(m => predictionByMatch[m.id]?.outcome === "WON").length;
-      const reward = rewardByLeague[g.league.id] || null;
+      const groupRewards = (rewardsByLeague[g.league.id] || [])
+        .sort((a, b) => a.milestone - b.milestone)
+        .map(r => ({ id: r.id, milestone: r.milestone, collected: !!r.collectedAt }));
 
       return {
         league: { id: g.league.id, name: g.league.name, type: g.league.type, flag: g.league.flag || null },
         progress: { won, total },
-        reward: reward ? { id: reward.id, collected: !!reward.collectedAt } : null,
+        rewards: groupRewards,
         matches: g.matches.map(m => {
           const mine = predictionByMatch[m.id];
           const played = m.status === "PLAYED";
